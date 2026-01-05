@@ -45,6 +45,10 @@ proc computeCid*(data: openArray[byte], config: BlockHashConfig): BResult[Cid] =
 proc computeCid*(data: openArray[byte]): BResult[Cid] =
   computeCid(data, defaultBlockHashConfig())
 
+proc cidFromHash*(hash: array[32, byte], config: BlockHashConfig): BResult[Cid] =
+  let mh = ?wrap(config.hashCode, hash)
+  newCidV1(config.blockCodec, mh)
+
 proc newBlock*(data: seq[byte], config: BlockHashConfig): BResult[Block] =
   let c = ?computeCid(data, config)
   var blk = new(Block)

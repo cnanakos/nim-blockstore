@@ -69,6 +69,7 @@ method getHash*(s: MerkleStorage, level: int, index: uint64): Option[MerkleHash]
 method setMetadata*(s: MerkleStorage, leafCount: uint64, numLevels: int): BResult[void] {.base, raises: [].}
 method getMetadata*(s: MerkleStorage): tuple[leafCount: uint64, numLevels: int] {.base, raises: [].}
 method close*(s: MerkleStorage): BResult[void] {.base, gcsafe, raises: [].}
+method abort*(s: MerkleStorage): BResult[void] {.base, gcsafe, raises: [].}
 method flush*(s: MerkleStorage) {.base, gcsafe, raises: [].}
 
 proc computeNumLevels*(leafCount: uint64): int =
@@ -113,6 +114,9 @@ method getMetadata*(s: MerkleStorage): tuple[leafCount: uint64, numLevels: int] 
   (0'u64, 0)
 
 method close*(s: MerkleStorage): BResult[void] {.base, gcsafe, raises: [].} =
+  ok()
+
+method abort*(s: MerkleStorage): BResult[void] {.base, gcsafe, raises: [].} =
   ok()
 
 method flush*(s: MerkleStorage) {.base, gcsafe, raises: [].} =
@@ -181,6 +185,20 @@ method getMetadata*(s: LevelDbMerkleStorage): tuple[leafCount: uint64, numLevels
     (0'u64, 0)
   except Exception:
     (0'u64, 0)
+
+method abort*(s: LevelDbMerkleStorage): BResult[void] {.raises: [].} =
+  try:
+    let (leafCount, numLevels) = s.getMetadata()
+    for level in 0 ..< numLevels:
+      let nodeCount = nodesAtLevel(leafCount, level)
+      for index in 0'u64 ..< nodeCount:
+        s.db.delete(levelDbKey(s.treeId, level, index))
+    s.db.delete(levelDbMetaKey(s.treeId))
+    ok()
+  except CatchableError as e:
+    err(databaseError(e.msg))
+  except Exception as e:
+    err(databaseError(e.msg))
 
 proc levelTempPath(basePath: string, level: int): string =
   basePath & ".L" & $level & ".tmp"
@@ -357,6 +375,23 @@ method flush*(s: PackedMerkleStorage) {.gcsafe.} =
     flushFile(s.file)
     for levelFile in s.levelFiles:
       flushFile(levelFile)
+
+method abort*(s: PackedMerkleStorage): BResult[void] {.gcsafe, raises: [].} =
+  try:
+    if s.readOnly:
+      s.memFile.close()
+    else:
+      for i, levelFile in s.levelFiles:
+        levelFile.close()
+        removeFile(levelTempPath(s.path, i + 1))
+      s.levelFiles = @[]
+      s.file.close()
+      removeFile(s.path)
+    ok()
+  except CatchableError as e:
+    err(ioError(e.msg))
+  except Exception as e:
+    err(ioError(e.msg))
 
 proc newStreamingMerkleBuilder*(storage: MerkleStorage): StreamingMerkleBuilder =
   StreamingMerkleBuilder(
@@ -558,6 +593,11 @@ proc rootCid*(builder: MerkleTreeBuilder): BResult[Cid] =
 
 proc blockCount*(builder: MerkleTreeBuilder): int =
   builder.leaves.len
+
+proc getLeafHash*(builder: MerkleTreeBuilder, index: int): Option[array[32, byte]] =
+  if index < 0 or index >= builder.leaves.len:
+    return none(array[32, byte])
+  some(builder.leaves[index])
 
 proc getProof*(builder: MerkleTreeBuilder, index: int): BResult[MerkleProof] =
   if index < 0 or index >= builder.leaves.len:

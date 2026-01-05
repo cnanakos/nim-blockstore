@@ -6,6 +6,7 @@ import ../blockstore/cid
 import ../blockstore/blocks
 import ../blockstore/dataset
 import ../blockstore/blockmap
+import ../blockstore/merkle
 
 const
   TestDir = getTempDir() / "nim_blockstore_dataset_test"
@@ -330,3 +331,193 @@ suite "Mapped blockmap backend tests":
 
   test "mapped blockmap files deleted with dataset":
     waitFor runMappedBlockmapDeletion()
+
+proc runAbortBasic() {.async.} =
+  cleanup()
+  createDir(TestDir)
+  createDir(BlocksDir)
+
+  let storeResult = newDatasetStore(DbPath, BlocksDir)
+  doAssert storeResult.isOk
+  let store = storeResult.value
+  defer: store.close()
+
+  let builderResult = store.startDataset(4096.uint32, some("test"))
+  doAssert builderResult.isOk
+  var builder = builderResult.value
+
+  for i in 0 ..< 5:
+    var data = newSeq[byte](4096)
+    for j in 0 ..< 4096:
+      data[j] = byte((i * 4096 + j) mod 256)
+    let blkResult = newBlock(data)
+    doAssert blkResult.isOk
+    let addResult = await builder.addBlock(blkResult.value)
+    doAssert addResult.isOk
+
+  let usedBefore = store.used()
+  doAssert usedBefore > 0
+
+  let abortResult = await builder.abort()
+  doAssert abortResult.isOk
+
+  cleanup()
+
+proc runAbortPreventsAddBlock() {.async.} =
+  cleanup()
+  createDir(TestDir)
+  createDir(BlocksDir)
+
+  let storeResult = newDatasetStore(DbPath, BlocksDir)
+  doAssert storeResult.isOk
+  let store = storeResult.value
+  defer: store.close()
+
+  let builderResult = store.startDataset(4096.uint32, some("test"))
+  doAssert builderResult.isOk
+  var builder = builderResult.value
+
+  let abortResult = await builder.abort()
+  doAssert abortResult.isOk
+
+  var data = newSeq[byte](4096)
+  let blkResult = newBlock(data)
+  doAssert blkResult.isOk
+
+  let addResult = await builder.addBlock(blkResult.value)
+  doAssert addResult.isErr
+  doAssert addResult.error.kind == InvalidOperation
+
+  cleanup()
+
+proc runAbortPreventsFinalize() {.async.} =
+  cleanup()
+  createDir(TestDir)
+  createDir(BlocksDir)
+
+  let storeResult = newDatasetStore(DbPath, BlocksDir)
+  doAssert storeResult.isOk
+  let store = storeResult.value
+  defer: store.close()
+
+  let builderResult = store.startDataset(4096.uint32, some("test"))
+  doAssert builderResult.isOk
+  var builder = builderResult.value
+
+  var data = newSeq[byte](4096)
+  let blkResult = newBlock(data)
+  doAssert blkResult.isOk
+  let addResult = await builder.addBlock(blkResult.value)
+  doAssert addResult.isOk
+
+  let abortResult = await builder.abort()
+  doAssert abortResult.isOk
+
+  let finalizeResult = await builder.finalize()
+  doAssert finalizeResult.isErr
+  doAssert finalizeResult.error.kind == InvalidOperation
+
+  cleanup()
+
+proc runAbortWithPackedBackend() {.async.} =
+  cleanup()
+  createDir(TestDir)
+  createDir(BlocksDir)
+
+  let storeResult = newDatasetStore(DbPath, BlocksDir, merkleBackend = mbPacked, blockBackend = bbPacked)
+  doAssert storeResult.isOk
+  let store = storeResult.value
+  defer: store.close()
+
+  let builderResult = store.startDataset(4096.uint32, some("test"))
+  doAssert builderResult.isOk
+  var builder = builderResult.value
+
+  for i in 0 ..< 5:
+    var data = newSeq[byte](4096)
+    for j in 0 ..< 4096:
+      data[j] = byte((i * 4096 + j) mod 256)
+    let blkResult = newBlock(data)
+    doAssert blkResult.isOk
+    let addResult = await builder.addBlock(blkResult.value)
+    doAssert addResult.isOk
+
+  let abortResult = await builder.abort()
+  doAssert abortResult.isOk
+
+  cleanup()
+
+proc runAbortWithLevelDbBackend() {.async.} =
+  cleanup()
+  createDir(TestDir)
+  createDir(BlocksDir)
+
+  let storeResult = newDatasetStore(DbPath, BlocksDir, merkleBackend = mbLevelDb)
+  doAssert storeResult.isOk
+  let store = storeResult.value
+  defer: store.close()
+
+  let builderResult = store.startDataset(4096.uint32, some("test"))
+  doAssert builderResult.isOk
+  var builder = builderResult.value
+
+  for i in 0 ..< 5:
+    var data = newSeq[byte](4096)
+    for j in 0 ..< 4096:
+      data[j] = byte((i * 4096 + j) mod 256)
+    let blkResult = newBlock(data)
+    doAssert blkResult.isOk
+    let addResult = await builder.addBlock(blkResult.value)
+    doAssert addResult.isOk
+
+  let abortResult = await builder.abort()
+  doAssert abortResult.isOk
+
+  cleanup()
+
+proc runAbortIdempotent() {.async.} =
+  cleanup()
+  createDir(TestDir)
+  createDir(BlocksDir)
+
+  let storeResult = newDatasetStore(DbPath, BlocksDir)
+  doAssert storeResult.isOk
+  let store = storeResult.value
+  defer: store.close()
+
+  let builderResult = store.startDataset(4096.uint32, some("test"))
+  doAssert builderResult.isOk
+  var builder = builderResult.value
+
+  let abort1 = await builder.abort()
+  doAssert abort1.isOk
+
+  let abort2 = await builder.abort()
+  doAssert abort2.isOk
+
+  cleanup()
+
+suite "DatasetBuilder abort tests":
+  setup:
+    cleanup()
+
+  teardown:
+    cleanup()
+
+  test "abort cleans up builder":
+    waitFor runAbortBasic()
+
+  test "abort prevents further addBlock":
+    waitFor runAbortPreventsAddBlock()
+
+  test "abort prevents finalize":
+    waitFor runAbortPreventsFinalize()
+
+  test "abort with packed backend":
+    waitFor runAbortWithPackedBackend()
+
+  test "abort with leveldb backend":
+    waitFor runAbortWithLevelDbBackend()
+
+  test "abort is idempotent":
+    waitFor runAbortIdempotent()

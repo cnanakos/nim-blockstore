@@ -112,7 +112,6 @@ type
     mimetype: Option[string]
     blockHashConfig: BlockHashConfig
     merkleBuilder: MerkleTreeBuilder
-    blockCids: seq[Cid]
     streamingBuilder: StreamingMerkleBuilder
     merkleStorage: MerkleStorage
     treeId: string
@@ -124,6 +123,7 @@ type
     blockmapBackend: BlockmapBackend
     ioMode: IOMode
     writeHandle: WriteHandle
+    aborted: bool
 
   LruIterator* = ref object
     datasets: seq[Cid]
@@ -833,7 +833,6 @@ proc startDataset*(store: DatasetStore, chunkSize: uint32, filename: Option[stri
     ioMode: store.ioMode,
     treeId: treeId,
     blockIndex: 0,
-    blockCids: @[],
     totalSize: 0,
     store: store
   )
@@ -1051,6 +1050,29 @@ proc getBlock*(dataset: Dataset, index: int): Future[BResult[Option[(blk.Block, 
   except CatchableError as e:
     return err(merkleTreeError("Failed to get proof: " & e.msg))
 
+proc blockIndices*(dataset: Dataset): Slice[int] =
+  0 ..< dataset.blockCount
+
+proc getBlocks*(dataset: Dataset, indices: seq[int]): Future[BResult[seq[Option[(blk.Block, MerkleProof)]]]] {.async.} =
+  var results = newSeq[Option[(blk.Block, MerkleProof)]](indices.len)
+  for i, index in indices:
+    let blockResult = await dataset.getBlock(index)
+    if blockResult.isErr:
+      return err(blockResult.error)
+    results[i] = blockResult.value
+  return ok(results)
+
+proc forEachBlock*(dataset: Dataset,
+                   cb: proc(index: int, blk: blk.Block, proof: MerkleProof): Future[void] {.async.}): Future[BResult[void]] {.async.} =
+  for i in dataset.blockIndices:
+    let blockResult = await dataset.getBlock(i)
+    if blockResult.isErr:
+      return err(blockResult.error)
+    if blockResult.value.isSome:
+      let (b, proof) = blockResult.value.get()
+      await cb(i, b, proof)
+  return ok()
+
 proc setFilename*(builder: DatasetBuilder, filename: string) =
   builder.filename = some(filename)
 
@@ -1071,6 +1093,9 @@ proc chunkFile*(builder: DatasetBuilder, pool: Taskpool): Future[BResult[AsyncCh
   return await chunker.chunkFile(builder.filename.get())
 
 proc addBlock*(builder: DatasetBuilder, b: blk.Block): Future[BResult[int]] {.async.} =
+  if builder.aborted:
+    return err(invalidOperationError("Builder has been aborted"))
+
   let
     blockSize = b.data.len.uint64
     index = builder.blockIndex
@@ -1078,7 +1103,6 @@ proc addBlock*(builder: DatasetBuilder, b: blk.Block): Future[BResult[int]] {.as
   case builder.merkleBackend
   of mbEmbeddedProofs:
     builder.merkleBuilder.addBlock(b.data)
-    builder.blockCids.add(b.cid)
   of mbLevelDb, mbPacked:
     let leafHash = builder.blockHashConfig.hashFunc(b.data)
     ?builder.streamingBuilder.addLeaf(leafHash)
@@ -1106,6 +1130,9 @@ proc addBlock*(builder: DatasetBuilder, b: blk.Block): Future[BResult[int]] {.as
   return ok(index)
 
 proc finalize*(builder: DatasetBuilder): Future[BResult[Dataset]] {.async.} =
+  if builder.aborted:
+    return err(invalidOperationError("Builder has been aborted"))
+
   let blockCount = builder.blockIndex
 
   if blockCount == 0:
@@ -1210,9 +1237,14 @@ proc finalize*(builder: DatasetBuilder): Future[BResult[Dataset]] {.async.} =
 
         for index in chunkStart ..< chunkEnd:
           let
+            leafHashOpt = builder.merkleBuilder.getLeafHash(index)
+          if leafHashOpt.isNone:
+            return err(invalidBlockError())
+          let
+            blockCid = ?blk.cidFromHash(leafHashOpt.get(), builder.blockHashConfig)
             proof = ?builder.merkleBuilder.getProof(index)
             blockRef = BlockRef(
-              blockCid: $builder.blockCids[index],
+              blockCid: $blockCid,
               proof: proof
             )
             blockRefBytes = ?serializeBlockRef(blockRef)
@@ -1262,6 +1294,61 @@ proc finalize*(builder: DatasetBuilder): Future[BResult[Dataset]] {.async.} =
     return ok(dataset)
   except LevelDbException as e:
     return err(databaseError(e.msg))
+
+proc abort*(builder: DatasetBuilder): Future[BResult[void]] {.async.} =
+  if builder.aborted:
+    return ok()
+
+  builder.aborted = true
+
+  case builder.merkleBackend
+  of mbEmbeddedProofs:
+    discard
+  of mbLevelDb:
+    discard builder.merkleStorage.abort()
+  of mbPacked:
+    if not builder.merkleStorage.isNil:
+      discard builder.merkleStorage.abort()
+
+  if builder.blockBackend == bbPacked:
+    if not builder.writeHandle.isNil:
+      builder.writeHandle.close()
+    let tempDataPath = getTmpPath(builder.store.dataDir, builder.treeId, ".data")
+    if fileExists(tempDataPath):
+      try:
+        removeFile(tempDataPath)
+      except OSError:
+        discard
+
+  for i in 0 ..< builder.blockIndex:
+    let key = datasetBlockKey(builder.treeId, i)
+
+    if builder.blockBackend == bbSharded:
+      case builder.merkleBackend
+      of mbEmbeddedProofs:
+        let leafHashOpt = builder.merkleBuilder.getLeafHash(i)
+        if leafHashOpt.isSome:
+          let cidResult = blk.cidFromHash(leafHashOpt.get(), builder.blockHashConfig)
+          if cidResult.isOk:
+            discard builder.store.repo.releaseBlock(cidResult.value)
+      of mbLevelDb, mbPacked:
+        try:
+          let valueOpt = builder.store.db.get(key)
+          if valueOpt.isSome:
+            let blockRefResult = deserializeBlockRefSimple(cast[seq[byte]](valueOpt.get))
+            if blockRefResult.isOk:
+              let cidResult = cidFromString(blockRefResult.value.blockCid)
+              if cidResult.isOk:
+                discard builder.store.repo.releaseBlock(cidResult.value)
+        except LevelDbException:
+          discard
+
+    try:
+      builder.store.db.delete(key)
+    except LevelDbException:
+      discard
+
+  return ok()
 
 proc next*(iter: LruIterator): Option[Cid] =
   if iter.index < iter.datasets.len:
