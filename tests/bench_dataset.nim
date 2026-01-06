@@ -38,6 +38,7 @@ type
     reportInterval: float
     poolSize: int
     blockHashConfig: BlockHashConfig
+    randomReads: bool
 
 proc formatSize(bytes: uint64): string =
   if bytes >= 1024'u64 * 1024 * 1024 * 1024:
@@ -128,6 +129,7 @@ proc runBenchmark(config: BenchConfig) {.async.} =
   echo &"Sync batch size: {config.syncBatchSize}"
   echo &"Thread pool size: {config.poolSize}"
   echo &"Data mode: {(if config.synthetic: \"synthetic\" else: \"file-based (async)\")}"
+  echo &"Read order: {(if config.randomReads: \"random\" else: \"sequential\")}"
   echo ""
 
   cleanup()
@@ -288,7 +290,21 @@ proc runBenchmark(config: BenchConfig) {.async.} =
   echo &"  Storage used: {formatSize(store.used())}"
   echo ""
 
-  echo "=== Read Benchmark (without verification) ==="
+  let readOrder = if config.randomReads:
+    echo "=== Read Benchmark (without verification, RANDOM order) ==="
+    var indices = newSeq[uint32](dataset.blockCount)
+    for i in 0 ..< dataset.blockCount:
+      indices[i] = i.uint32
+    randomize()
+    shuffle(indices)
+    indices
+  else:
+    echo "=== Read Benchmark (without verification) ==="
+    var indices = newSeq[uint32](dataset.blockCount)
+    for i in 0 ..< dataset.blockCount:
+      indices[i] = i.uint32
+    indices
+
   echo "Reading all blocks..."
 
   let readStart = epochTime()
@@ -297,15 +313,15 @@ proc runBenchmark(config: BenchConfig) {.async.} =
   var lastReadReport = readStart
   var lastReadBytes: uint64 = 0
 
-  for i in 0 ..< dataset.blockCount:
-    let blockResult = await dataset.getBlock(i)
+  for idx in readOrder:
+    let blockResult = await dataset.getBlock(idx.int)
     if blockResult.isErr:
-      echo &"Failed to read block {i}: {blockResult.error}"
+      echo &"Failed to read block {idx}: {blockResult.error}"
       break
 
     let blockOpt = blockResult.value
     if blockOpt.isNone:
-      echo &"Block {i} not found"
+      echo &"Block {idx} not found"
       break
 
     let (blk, _) = blockOpt.get()
@@ -327,14 +343,17 @@ proc runBenchmark(config: BenchConfig) {.async.} =
   let readRate = readBytes.float / readTime
 
   echo ""
-  echo "Read complete (no verification):"
+  echo &"Read complete (no verification{(if config.randomReads: \", random\" else: \"\")}):"
   echo &"  Blocks read: {readBlocks}"
   echo &"  Bytes read: {formatSize(readBytes)}"
   echo &"  Time: {readTime:.2f}s"
   echo &"  Rate: {formatRate(readRate)}"
   echo ""
 
-  echo "=== Read Benchmark (with verification) ==="
+  if config.randomReads:
+    echo "=== Read Benchmark (with verification, RANDOM order) ==="
+  else:
+    echo "=== Read Benchmark (with verification) ==="
   echo "Reading and verifying all blocks..."
 
   let mhashResult = dataset.treeCid.mhash()
@@ -358,15 +377,15 @@ proc runBenchmark(config: BenchConfig) {.async.} =
   var lastVerifyReport = verifyStart
   var lastVerifyBytes: uint64 = 0
 
-  for i in 0 ..< dataset.blockCount:
-    let blockResult = await dataset.getBlock(i)
+  for idx in readOrder:
+    let blockResult = await dataset.getBlock(idx.int)
     if blockResult.isErr:
-      echo &"Failed to read block {i}: {blockResult.error}"
+      echo &"Failed to read block {idx}: {blockResult.error}"
       break
 
     let blockOpt = blockResult.value
     if blockOpt.isNone:
-      echo &"Block {i} not found"
+      echo &"Block {idx} not found"
       break
 
     let (blk, proof) = blockOpt.get()
@@ -375,7 +394,7 @@ proc runBenchmark(config: BenchConfig) {.async.} =
     if not verify(proof, rootHash, leafHash):
       verifyFailed += 1
       if verifyFailed <= 5:
-        echo &"  WARNING: Block {i} verification failed!"
+        echo &"  WARNING: Block {idx} verification failed!"
 
     verifiedBlocks += 1
     verifiedBytes += blk.data.len.uint64
@@ -395,7 +414,7 @@ proc runBenchmark(config: BenchConfig) {.async.} =
   let verifyRate = verifiedBytes.float / verifyTime
 
   echo ""
-  echo "Read with verification complete:"
+  echo &"Read with verification complete{(if config.randomReads: \" (random)\" else: \"\")}:"
   echo &"  Blocks verified: {verifiedBlocks}"
   echo &"  Verification failures: {verifyFailed}"
   echo &"  Bytes verified: {formatSize(verifiedBytes)}"
@@ -423,6 +442,7 @@ proc printUsage() =
   echo "  --sync=<value>       Sync batch: none, every, or N (default: none)"
   echo "  --pool=<size>        Thread pool size for async I/O (default: 4, min: 2)"
   echo "  --synthetic          Use synthetic in-memory data (no file I/O)"
+  echo "  --random             Read blocks in random order (default: sequential)"
   echo "  --help               Show this help"
 
 proc main() =
@@ -437,7 +457,8 @@ proc main() =
     synthetic: false,
     reportInterval: 1.0,
     poolSize: DefaultPoolSize,
-    blockHashConfig: defaultBlockHashConfig()
+    blockHashConfig: defaultBlockHashConfig(),
+    randomReads: false
   )
 
   for arg in commandLineParams():
@@ -488,6 +509,8 @@ proc main() =
         echo &"Invalid pool size: {arg[7..^1]}"; return
     elif arg == "--synthetic":
       config.synthetic = true
+    elif arg == "--random":
+      config.randomReads = true
     elif arg == "--help":
       printUsage()
       return
