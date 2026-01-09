@@ -76,6 +76,7 @@ type
     db: LevelDb
     blockmapBackend: BlockmapBackend
     blockmapSeq: seq[byte]
+    blockmapPending: seq[int]
     blockmapFile: FileBlockmap
     merkleBackend: MerkleBackend
     merkleReader: MerkleReader
@@ -147,13 +148,6 @@ proc markBlock(dataset: Dataset, index: int, value: bool): BResult[void] {.inlin
     else:
       ?dataset.blockmapFile.clear(index.uint64)
     ok()
-
-proc flushBlockmap(dataset: Dataset) =
-  case dataset.blockmapBackend
-  of bmLevelDb:
-    discard
-  of bmFile:
-    dataset.blockmapFile.flush()
 
 proc close*(dataset: Dataset) =
   case dataset.blockmapBackend
@@ -945,7 +939,7 @@ proc saveBlockmap(dataset: Dataset): BResult[void] =
     except LevelDbException as e:
       err(databaseError(e.msg))
   of bmFile:
-    dataset.flushBlockmap()
+    dataset.blockmapFile.flush()
     ok()
 
 proc putBlock*(dataset: Dataset, b: blk.Block, index: int, proof: MerkleProof): Future[BResult[void]] {.async.} =
@@ -958,7 +952,7 @@ proc putBlock*(dataset: Dataset, b: blk.Block, index: int, proof: MerkleProof): 
   if proof.leafCount != uint64(dataset.blockCount):
     return err(invalidProofError())
 
-  discard ?await dataset.repo.putBlock(b)
+  let (_, synced) = ?await dataset.repo.putBlock(b)
 
   let key = datasetBlockKey(dataset.treeId, index)
 
@@ -974,9 +968,17 @@ proc putBlock*(dataset: Dataset, b: blk.Block, index: int, proof: MerkleProof): 
   try:
     dataset.db.put(key, cast[string](blockRefBytes))
 
-    ?dataset.markBlock(index, true)
+    # Only update the blockmap when blocks are synced (or
+    # we've disabled consistency) or we may report blocks
+    # we don't have.
+    if synced or dataset.repo.syncBatchSize == 0:
+      for index in dataset.blockmapPending:
+        ?dataset.markBlock(index, true)
 
-    ?dataset.saveBlockmap()
+      ?dataset.saveBlockmap()
+      dataset.blockmapPending = @[]
+    else:
+      dataset.blockmapPending.add(index)
 
     return ok()
   except LevelDbException as e:
